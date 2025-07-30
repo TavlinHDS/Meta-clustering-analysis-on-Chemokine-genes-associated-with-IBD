@@ -1,0 +1,637 @@
+```{r}
+
+# ===== Setup & Required Libraries =====
+required_packages <- c(
+  "ConsensusClusterPlus", "dplyr", "ggplot2", "RColorBrewer", "pheatmap",
+  "scatterplot3d", "tibble", "GEOquery", "GMCM", "mclust", "scales",
+  "cluster", "factoextra", "png", "grid", "gridExtra", "openxlsx"
+)
+
+install_if_missing <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    if (pkg == "ConsensusClusterPlus") {
+      if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+      BiocManager::install(pkg)
+    } else {
+      install.packages(pkg)
+    }
+  }
+}
+invisible(sapply(required_packages, install_if_missing))
+suppressPackageStartupMessages(lapply(required_packages, library, character.only = TRUE))
+
+# ===== Directory Setup =====
+base_dir <- "C:/Users/lenov/Downloads/GSEDATASETS"
+dir.create(base_dir, showWarnings = FALSE, recursive = TRUE)
+knitr::opts_knit$set(root.dir = base_dir)
+setwd(base_dir)
+
+# ===== Input Files =====
+input_files <- list(
+  GSE75214 = "GSE75214_cxcl.csv",
+  GSE36807 = "GSE36807_cxcl.csv",
+  GSE235236 = "GSE235236_RNAseq_CXCL_Only.csv"
+)
+
+# ===== Expression Cleaning & Transformation =====
+load_and_process_expr <- function(file, dataset_tag = NULL) {
+  df <- read.csv(file, row.names = 1, check.names = FALSE)
+
+  # Log2 transform check
+  if (max(df, na.rm = TRUE) > 50) {
+    message(dataset_tag, ": appears raw — applying log2(TPM + 1)")
+    df <- log2(df + 1)
+  } else {
+    message(dataset_tag, ": already log-scaled — no transformation needed")
+  }
+
+  df <- df %>%
+    as.matrix() %>%
+    t() %>%
+    scale() %>%
+    t() %>%
+    .[apply(., 1, function(x) var(x, na.rm = TRUE) > 0.1), ]
+
+  return(df)
+}
+
+expr_list_processed <- list(
+  GSE75214   = load_and_process_expr(input_files$GSE75214,   "GSE75214"),
+  GSE36807   = load_and_process_expr(input_files$GSE36807,   "GSE36807"),
+  GSE235236  = load_and_process_expr(input_files$GSE235236,  "GSE235236")
+)
+
+# ===== Clean Column Names =====
+expr_list_processed <- lapply(expr_list_processed, function(mat) {
+  colnames(mat) <- gsub("\\.CEL.*$", "", colnames(mat), ignore.case = TRUE)
+  colnames(mat) <- sub("_.*", "", colnames(mat))
+  mat
+})
+
+expr_z_75214   <- expr_list_processed$GSE75214
+expr_z_36807   <- expr_list_processed$GSE36807
+expr_z_235236  <- expr_list_processed$GSE235236
+
+# ===== Metadata Extraction from GEO =====
+get_metadata <- function(geo_id) {
+  geo <- tryCatch(getGEO(geo_id, GSEMatrix = TRUE), error = function(e) NULL)
+  if (is.null(geo)) return(NULL)
+
+  pdata <- pData(geo[[1]])
+  pdata <- pdata[, !duplicated(colnames(pdata))]
+  title_col <- if ("title" %in% colnames(pdata)) pdata$title else rep(NA, nrow(pdata))
+
+  tibble(
+    Sample = rownames(pdata),
+    Title = as.character(title_col),
+    Group = case_when(
+      grepl("uc|ulcerative|colitis", title_col, ignore.case = TRUE) ~ "UC",
+      grepl("cd|crohn|crohns|crohn'?s|disease", title_col, ignore.case = TRUE) ~ "CD",
+      grepl("control|healthy|normal", title_col, ignore.case = TRUE) ~ "Healthy",
+      TRUE ~ "Other"
+    ),
+    Activity = case_when(
+      grepl("inactive", title_col, ignore.case = TRUE) ~ "Inactive",
+      TRUE ~ "Active"
+    )
+  )
+}
+
+metadata_75214   <- get_metadata("GSE75214")
+metadata_36807   <- get_metadata("GSE36807")
+
+# ===== Custom Metadata for GSE235236 =====
+gse235236 <- getGEO("GSE235236", GSEMatrix = TRUE)
+pdata235  <- pData(gse235236[[1]])
+
+metadata_235236 <- tibble(
+  Sample = rownames(pdata235),
+  Title  = pdata235$title,
+  Group = case_when(
+    grepl("\\bUC\\b", pdata235$`disease:ch1`, ignore.case = TRUE) ~ "UC",
+    grepl("\\bCD\\b", pdata235$`disease:ch1`, ignore.case = TRUE) ~ "CD",
+    grepl("\\bHC\\b|control|healthy", pdata235$`disease:ch1`, ignore.case = TRUE) ~ "Healthy",
+    TRUE ~ "Other"
+  ),
+  Activity = case_when(
+    grepl("inactive|remission", pdata235$`disease type:ch1`, ignore.case = TRUE) ~ "Inactive",
+    TRUE ~ "Active"
+  )
+)
+
+# ===== Sample Annotation Creation =====
+process_annotation <- function(metadata, expr_matrix) {
+  metadata %>%
+    filter(Sample %in% colnames(expr_matrix)) %>%
+    distinct(Sample, Group) %>%
+    column_to_rownames("Sample") %>%
+    .[colnames(expr_matrix), , drop = FALSE]
+}
+
+sample_annot_75214   <- process_annotation(metadata_75214,  expr_z_75214)
+sample_annot_36807   <- process_annotation(metadata_36807,  expr_z_36807)
+sample_annot_235236  <- process_annotation(metadata_235236, expr_z_235236)
+
+# ===== Safety Alignment Check =====
+stopifnot(
+  all(colnames(expr_z_75214)  == rownames(sample_annot_75214)),
+  all(colnames(expr_z_36807)  == rownames(sample_annot_36807)),
+  all(colnames(expr_z_235236) == rownames(sample_annot_235236))
+)
+
+# ===== Split Expression Matrices by Group =====
+split_by_group <- function(expr, annot) {
+  annot <- annot[colnames(expr), , drop = FALSE]
+  split_samples <- split(colnames(expr), annot$Group)
+  lapply(split_samples, function(samples) expr[, samples, drop = FALSE])
+}
+
+expr_groups_75214   <- split_by_group(expr_z_75214,  sample_annot_75214)
+expr_groups_36807   <- split_by_group(expr_z_36807,  sample_annot_36807)
+expr_groups_235236  <- split_by_group(expr_z_235236, sample_annot_235236)
+
+# ===== Final Group Counts Check =====
+cat("✅ Final group counts per dataset:\n")
+
+cat("\n📊 GSE75214:\n")
+print(table(sample_annot_75214$Group))
+
+cat("\n📊 GSE36807:\n")
+print(table(sample_annot_36807$Group))
+
+cat("\n📊 GSE235236:\n")
+print(table(sample_annot_235236$Group))
+
+
+```
+
+
+
+
+
+
+
+
+
+```{r}
+# ===== Load Libraries =====
+library(dplyr)
+library(ggplot2)
+library(GMCM)
+library(mclust)
+library(scales)
+library(cluster)
+library(factoextra)
+library(gridExtra)
+library(png)
+library(grid)
+
+# ===== Directory Setup =====
+knitr::opts_knit$set(root.dir = "C:/Users/lenov/Downloads/GSEDATASETS")
+setwd("C:/Users/lenov/Downloads/GSEDATASETS")
+base_dir <- "C:/Users/lenov/Downloads/GSEDATASETS"
+dir.create(base_dir, showWarnings = FALSE, recursive = TRUE)
+
+# ===== Split Expression Matrix by Group =====
+split_by_group <- function(expr, annot) {
+  annot <- annot[colnames(expr), , drop = FALSE]
+  split_samples <- split(colnames(expr), annot$Group)
+  lapply(split_samples, function(samples) expr[, samples, drop = FALSE])
+}
+
+# ====== Split Expression by Group ======
+expr_groups_75214 <- split_by_group(expr_z_75214, sample_annot_75214)
+expr_groups_36807 <- split_by_group(expr_z_36807, sample_annot_36807)
+expr_groups_235236 <- split_by_group(expr_z_235236, sample_annot_235236)
+
+# ===== Elbow Plot Function =====
+plot_elbow <- function(expr, group_name, dataset_id, max_k = 5) {
+  wss <- numeric(max_k)
+  for (k in 1:max_k) {
+    km <- kmeans(expr, centers = k, nstart = 10)
+    wss[k] <- km$tot.withinss
+  }
+
+  elbow_df <- data.frame(k = 1:max_k, WSS = wss)
+  point1 <- c(1, wss[1])
+  point2 <- c(max_k, wss[max_k])
+  distances <- sapply(1:max_k, function(i) {
+    numerator <- abs((point2[2] - point1[2]) * (i - point1[1]) -
+                     (point2[1] - point1[1]) * (wss[i] - point1[2]))
+    denominator <- sqrt((point2[2] - point1[2])^2 + (point2[1] - point1[1])^2)
+    return(numerator / denominator)
+  })
+  optimal_k <- which.max(distances)
+
+  p <- ggplot(elbow_df, aes(x = k, y = WSS)) +
+    geom_line(size = 1.2, color = "#0072B2") +
+    geom_point(size = 4, color = "#0072B2") +
+    geom_vline(xintercept = optimal_k, linetype = "dashed", color = "#D55E00", linewidth = 1) +
+    annotate("text", x = optimal_k + 0.5, y = max(wss) * 0.9,
+             label = paste("Elbow at k =", optimal_k),
+             color = "#D55E00", size = 5, hjust = 0) +
+    scale_x_continuous(breaks = 1:max_k) +
+    scale_y_continuous(labels = comma_format()) +
+    labs(title = paste0("Elbow Plot – ", group_name, " (", dataset_id, ")"),
+         subtitle = "Optimal number of clusters based on max perpendicular distance",
+         x = "Number of Clusters (k)", y = "Within-Cluster Sum of Squares (WSS)") +
+    theme(
+      plot.background = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "white", color = NA),
+      panel.grid.major = element_line(color = "grey90"),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(fill = NA, color = "black"),
+      plot.title = element_text(face = "bold", size = 18, hjust = 0.5),
+      plot.subtitle = element_text(size = 14, color = "gray30", hjust = 0.5),
+      axis.title = element_text(size = 14),
+      axis.text = element_text(size = 12)
+    )
+
+  ggsave(filename = paste0(dataset_id, "_", group_name, "_elbow_plot.png"),
+         plot = p, width = 8, height = 6, dpi = 300)
+
+  cat("📉 Elbow plot saved for", group_name, "with optimal k =", optimal_k, "\n")
+  return(optimal_k)
+}
+
+# ===== Combined Elbow Plot with Color Distinction =====
+plot_elbow_combined <- function(expr_groups, dataset_id, max_k = 5) {
+  elbow_data <- data.frame()
+  elbow_marks <- data.frame()
+  group_colors <- c(CD = "#0072B2", UC = "#D55E00", Healthy = "#009E73")
+
+  for (group in names(expr_groups)) {
+    expr <- expr_groups[[group]]
+    wss <- sapply(1:max_k, function(k) kmeans(expr, centers = k, nstart = 10)$tot.withinss)
+
+    # Elbow detection via max perpendicular distance
+    p1 <- c(1, wss[1])
+    p2 <- c(max_k, wss[max_k])
+    dists <- sapply(1:max_k, function(i) {
+      abs((p2[2] - p1[2]) * (i - p1[1]) - (p2[1] - p1[1]) * (wss[i] - p1[2])) /
+        sqrt((p2[2] - p1[2])^2 + (p2[1] - p1[1])^2)
+    })
+    k_opt <- which.max(dists)
+
+    elbow_data <- rbind(elbow_data, data.frame(k = 1:max_k, WSS = wss, Group = group))
+    elbow_marks <- rbind(elbow_marks, data.frame(k = k_opt, WSS = wss[k_opt], Group = group))
+    cat("📉", dataset_id, group, "elbow at k =", k_opt, "\n")
+  }
+
+  gg <- ggplot(elbow_data, aes(x = k, y = WSS, color = Group)) +
+    geom_line(size = 1.2) +
+    geom_point(size = 3) +
+    geom_vline(data = elbow_marks, aes(xintercept = k, color = Group),
+               linetype = "dashed", linewidth = 1) +
+    geom_label(data = elbow_marks,
+               aes(x = k, y = WSS + diff(range(WSS)) * 0.05, label = paste("k =", k)),
+               fill = "gray95", color = "black", size = 4, fontface = "bold") +
+    scale_color_manual(values = group_colors[names(expr_groups)]) +
+    scale_x_continuous(breaks = 1:max_k) +
+    scale_y_continuous(
+      breaks = pretty(elbow_data$WSS, n = 12),
+      labels = comma_format()
+    ) +
+    labs(
+      title = paste0("Elbow Plot across all groups for ", dataset_id),
+      subtitle = "Group-wise WSS curves with elbow detection (maximum perpendicular distance method)",
+      x = "Number of Clusters (k)",
+      y = "Within-Cluster Sum of Squares",
+      color = "Group"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.background = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "white", color = NA),
+      panel.grid.major = element_line(color = "grey90"),
+      panel.grid.minor = element_blank(),
+      legend.position = "bottom",
+      legend.background = element_rect(fill = "white", color = NA),
+      legend.key = element_rect(fill = "white", color = NA),
+      legend.text = element_text(size = 12),
+      plot.title = element_text(face = "bold", size = 18, hjust = 0.5),
+      plot.subtitle = element_text(size = 14, hjust = 0.5, color = "gray40"),
+      axis.title.x = element_text(size = 14, hjust = 0.5),
+      axis.title.y = element_text(size = 14, hjust = 0.5)
+    )
+
+  ggsave(filename = file.path(base_dir, paste0(dataset_id, "_elbow_combined_refined.png")),
+         plot = gg, width = 10, height = 6, dpi = 300)
+  cat("🖼️ Saved:", dataset_id, "_elbow_combined_refined.png\n")
+}
+# ===== Combine Elbow Plots by Stitching PNGs =====
+combine_elbow_plots <- function(dataset_id, groups) {
+  plots <- list()
+  for (group in groups) {
+    file <- paste0(dataset_id, "_", group, "_elbow_plot.png")
+    if (file.exists(file)) {
+      img <- png::readPNG(file)
+      plots[[group]] <- grid::rasterGrob(img, interpolate = TRUE)
+    }
+  }
+
+  png(filename = file.path(base_dir, paste0(dataset_id, "_elbow_combined_stitched.png")),
+      width = 2400, height = 800, res = 150)
+  gridExtra::grid.arrange(grobs = plots, ncol = length(plots),
+                          top = grid::textGrob(paste(dataset_id, "– Elbow Plots"),
+                                               gp = grid::gpar(fontsize = 16, fontface = "bold")))
+  dev.off()
+  cat("🖼️ Combined stitched elbow plot saved for", dataset_id, "\n")
+}
+
+# ===== Apply on Each Group =====
+all_expr_groups <- list(
+  GSE75214 = expr_groups_75214,
+  GSE36807 = expr_groups_36807,
+  GSE235236 = expr_groups_235236
+)
+
+#===============CLUSTERING===================
+run_all_clusterings <- function(expr, group_name, dataset_id, k) {
+  set.seed(42)
+
+  # KMeans
+  km <- kmeans(expr, centers = k)
+  write.csv(data.frame(Gene = rownames(expr), Cluster = km$cluster),
+            file = paste0(dataset_id, "_", group_name, "_kmeans.csv"), row.names = FALSE)
+
+  # Hierarchical
+  hc <- hclust(dist(expr), method = "ward.D2")
+  hc_clusters <- cutree(hc, k = k)
+  write.csv(data.frame(Gene = rownames(expr), Cluster = hc_clusters),
+            file = paste0(dataset_id, "_", group_name, "_hc.csv"), row.names = FALSE)
+
+  # GMM
+  gmm_fit <- Mclust(expr, G = k)
+  gmm_clusters <- gmm_fit$classification
+  write.csv(data.frame(Gene = rownames(expr), Cluster = gmm_clusters),
+            file = paste0(dataset_id, "_", group_name, "_gmm.csv"), row.names = FALSE)
+
+  cat("✅ Clustering done for", group_name, "in", dataset_id, "with k =", k, "\n")
+}
+
+#================PCAs=======================
+compute_silhouette <- function(expr, clusters) {
+  d <- dist(expr)
+  sil <- silhouette(clusters, d)
+  mean(sil[, 3])
+}
+
+plot_pca_clusters <- function(expr, clusters, method, dataset_id, group_name) {
+  pca <- prcomp(expr, scale. = TRUE)
+  df <- as.data.frame(pca$x[, 1:2])
+  df$Cluster <- as.factor(clusters)
+
+  ggplot(df, aes(x = PC1, y = PC2, color = Cluster)) +
+    geom_point(size = 3) +
+    stat_ellipse(aes(fill = Cluster), geom = "polygon", alpha = 0.2, color = NA) +
+    labs(
+      title = paste("PCA –", method),
+      subtitle = paste(dataset_id, "–", group_name),
+      x = "PC1", y = "PC2"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(size = 11, face = "italic", color = "gray40"),
+      axis.title = element_text(size = 12)
+    )
+}
+
+plot_and_save_all_pcas <- function(expr, dataset_id, group_name) {
+  km_df  <- read.csv(paste0(dataset_id, "_", group_name, "_kmeans.csv"))
+  hc_df  <- read.csv(paste0(dataset_id, "_", group_name, "_hc.csv"))
+  gmm_df <- read.csv(paste0(dataset_id, "_", group_name, "_gmm.csv"))
+
+  genes <- Reduce(intersect, list(km_df$Gene, hc_df$Gene, gmm_df$Gene))
+  expr <- expr[genes, , drop = FALSE]
+
+  km_clusters  <- km_df$Cluster[match(genes, km_df$Gene)]
+  hc_clusters  <- hc_df$Cluster[match(genes, hc_df$Gene)]
+  gmm_clusters <- gmm_df$Cluster[match(genes, gmm_df$Gene)]
+
+  sil_km  <- compute_silhouette(expr, km_clusters)
+  sil_hc  <- compute_silhouette(expr, hc_clusters)
+  sil_gmm <- compute_silhouette(expr, gmm_clusters)
+
+  p1 <- plot_pca_clusters(expr, km_clusters,  paste0("KMeans (Sil=", round(sil_km, 2), ")"),  dataset_id, group_name)
+  p2 <- plot_pca_clusters(expr, hc_clusters,  paste0("Hierarchical (Sil=", round(sil_hc, 2), ")"),  dataset_id, group_name)
+  p3 <- plot_pca_clusters(expr, gmm_clusters, paste0("GMM (Sil=", round(sil_gmm, 2), ")"),     dataset_id, group_name)
+
+  png(file.path(base_dir, paste0(dataset_id, "_", group_name, "_PCA_all_clusters.png")),
+      width = 1800, height = 600, res = 150)
+  gridExtra::grid.arrange(p1, p2, p3, ncol = 3)
+  dev.off()
+
+  cat("✅ PCA + silhouette saved for", dataset_id, group_name, "\n")
+}
+
+#=============FUNCTION CALLING ALL THE FUNCTION================
+
+for (dataset_id in names(all_expr_groups)) {
+  expr_groups <- all_expr_groups[[dataset_id]]
+  for (group in names(expr_groups)) {
+    k_opt <- plot_elbow(expr_groups[[group]], group, dataset_id, max_k = 5)
+    run_all_clusterings(expr_groups[[group]], group, dataset_id, k = k_opt)
+    plot_and_save_all_pcas(expr_groups[[group]], dataset_id, group)
+  }
+  plot_elbow_combined(expr_groups, dataset_id)
+  combine_elbow_plots(dataset_id, names(expr_groups))
+}
+
+
+```
+
+
+
+
+
+
+
+
+```{r}
+
+# ===== Load Required Libraries =====
+packages <- c("dplyr", "mclust", "pheatmap", "cluster", "openxlsx", "RColorBrewer")
+if (!requireNamespace("magick", quietly = TRUE)) install.packages("magick")
+library(magick)
+invisible(lapply(packages, function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+  library(pkg, character.only = TRUE)
+}))
+library(grid)
+library(gridExtra)
+
+# ===== Directory Setup =====
+knitr::opts_knit$set(root.dir = "C:/Users/lenov/Downloads/GSEDATASETS")
+setwd("C:/Users/lenov/Downloads/GSEDATASETS")
+base_dir <- "C:/Users/lenov/Downloads/GSEDATASETS"
+dir.create(base_dir, showWarnings = FALSE, recursive = TRUE)
+
+# ===== Load Clustering Labels =====
+load_cluster_labels <- function(dataset_id, group) {
+  methods <- c("kmeans", "hc", "gmm")
+  dfs <- list()
+
+  for (method in methods) {
+    file_path <- paste0(dataset_id, "_", group, "_", method, ".csv")
+    if (file.exists(file_path)) {
+      df <- read.csv(file_path)
+      colnames(df)[2] <- toupper(method)
+      dfs[[toupper(method)]] <- df
+    } else {
+      warning(paste("❌ Missing file:", file_path))
+    }
+  }
+
+  if (length(dfs) < 2) {
+    stop("❗ Less than two clustering methods found. Meta-clustering not reliable.")
+  }
+
+  merged <- Reduce(function(x, y) full_join(x, y, by = "Gene"), dfs)
+  merged <- merged %>% filter(complete.cases(.))
+  return(merged)
+}
+
+# ===== Save Combined Cluster Labels with MetaCluster =====
+save_cluster_labels_excel <- function(dataset_id, group, meta_clusters = NULL) {
+  merged_df <- load_cluster_labels(dataset_id, group)
+
+  if (nrow(merged_df) == 0) {
+    warning(paste("No complete clustering data found for", dataset_id, group))
+    return()
+  }
+
+  if (!is.null(meta_clusters)) {
+    merged_df$MetaCluster <- meta_clusters[merged_df$Gene]
+  }
+
+  file_path <- paste0(dataset_id, "_", group, "_all_clusters.xlsx")
+  write.xlsx(merged_df, file = file_path, asTable = TRUE, rowNames = FALSE)
+  cat("📁 Saved Excel with MetaCluster:", file_path, "\n")
+}
+
+# ===== Build Consensus Matrix =====
+build_consensus_matrix <- function(clust_df) {
+  genes <- clust_df$Gene
+  n <- length(genes)
+  methods <- clust_df[, -1]
+
+  consensus <- matrix(0, n, n)
+  rownames(consensus) <- colnames(consensus) <- genes
+
+  for (method in names(methods)) {
+    cluster_ids <- methods[[method]]
+    for (i in 1:(n - 1)) {
+      for (j in (i + 1):n) {
+        if (cluster_ids[i] == cluster_ids[j] && cluster_ids[i] > 0) {
+          consensus[i, j] <- consensus[i, j] + 1
+          consensus[j, i] <- consensus[j, i] + 1
+        }
+      }
+    }
+  }
+
+  diag(consensus) <- ncol(methods)
+  consensus <- consensus / ncol(methods)
+  return(consensus)
+}
+
+# ===== Determine Optimal k Using Silhouette Score =====
+find_best_k <- function(consensus, k_range = 2:3) {
+  dist_mat <- as.dist(1 - consensus)
+  hc <- hclust(dist_mat, method = "average")
+
+  best_k <- NULL
+  best_score <- -Inf
+
+  for (k in k_range) {
+    cluster_labels <- cutree(hc, k = k)
+    sil <- silhouette(cluster_labels, dist_mat)
+    avg_sil <- mean(sil[, 3])
+    if (avg_sil > best_score) {
+      best_score <- avg_sil
+      best_k <- k
+    }
+  }
+
+  return(best_k)
+}
+
+# ===== Draw Heatmap =====
+draw_consensus_heatmap <- function(consensus, hc, dataset_id, group, optimal_k) {
+  ordered_genes <- rownames(consensus)[hc$order]
+  consensus_ordered <- consensus[ordered_genes, ordered_genes]
+  cluster_labels <- cutree(hc, k = optimal_k)[ordered_genes]
+
+  annotation_df <- data.frame(Cluster = factor(cluster_labels))
+  rownames(annotation_df) <- ordered_genes
+  cluster_palette <- brewer.pal(max(3, optimal_k), "Set2")[1:optimal_k]
+  names(cluster_palette) <- levels(annotation_df$Cluster)
+
+  pheatmap::pheatmap(consensus_ordered,
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    annotation_row = annotation_df,
+    annotation_col = annotation_df,
+    annotation_colors = list(Cluster = cluster_palette),
+    main = paste0("GSE: ", dataset_id, "   |   Group: ", group, "   |   k = ", optimal_k, "\n"),
+    color = colorRampPalette(c("#E0ECF4", "#9ECAE1", "#084594"))(100),
+    border_color = "white",
+    fontsize = 9,
+    filename = paste0(dataset_id, "_", group, "_consensus_heatmap.png"),
+    width = 12,
+    height = 10
+  )
+}
+
+# ===== Meta-Clustering Wrapper =====
+meta_cluster_and_save <- function(dataset_id, group) {
+  clust_df <- load_cluster_labels(dataset_id, group)
+  consensus <- build_consensus_matrix(clust_df)
+  write.csv(consensus, paste0(dataset_id, "_", group, "_consensus_matrix.csv"), row.names = TRUE)
+
+  dist_mat <- as.dist(1 - consensus)
+  hc <- hclust(dist_mat, method = "average")
+  optimal_k <- find_best_k(consensus)
+
+  meta_clusters <- cutree(hc, k = optimal_k)
+  result <- data.frame(Gene = names(meta_clusters), MetaCluster = meta_clusters)
+  write.csv(result, paste0(dataset_id, "_", group, "_meta_clusters.csv"), row.names = FALSE)
+
+  save_cluster_labels_excel(dataset_id, group, meta_clusters)
+  draw_consensus_heatmap(consensus, hc, dataset_id, group, optimal_k)
+
+  cat("✅ Meta-clustering complete for", group, "(", dataset_id, ") with k =", optimal_k, "\n")
+}
+
+# ===== Stitch Heatmaps Vertically per Dataset =====
+combine_heatmaps_for_gse <- function(dataset_id, group_list) {
+  image_paths <- paste0(dataset_id, "_", group_list, "_consensus_heatmap.png")
+  if (all(file.exists(image_paths))) {
+    img_stack <- image_read(image_paths)
+    img_combined <- image_append(img_stack, stack = FALSE)  # vertical layout
+    output_file <- paste0(dataset_id, "_MetaCluster_combined.jpg")
+    image_write(img_combined, output_file, format = "jpg")
+    cat("🧵 Combined heatmap saved as:", output_file, "\n")
+  } else {
+    warning("⚠️ Not all expected heatmaps found for ", dataset_id)
+  }
+}
+
+# ===== Run Meta-Clustering for All Datasets =====
+groups_75214   <- names(expr_groups_75214)
+groups_36807   <- names(expr_groups_36807)
+groups_235236  <- names(expr_groups_235236)
+
+for (g in groups_75214)   meta_cluster_and_save("GSE75214", g)
+combine_heatmaps_for_gse("GSE75214", groups_75214)
+
+for (g in groups_36807)   meta_cluster_and_save("GSE36807", g)
+combine_heatmaps_for_gse("GSE36807", groups_36807)
+
+for (g in groups_235236)  meta_cluster_and_save("GSE235236", g)
+combine_heatmaps_for_gse("GSE235236", groups_235236)
+
+```
+

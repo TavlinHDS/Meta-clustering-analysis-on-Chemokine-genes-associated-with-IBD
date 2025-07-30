@@ -1,0 +1,174 @@
+```{r}
+
+# ── 0. packages ────────────────────────────────────────────────────────────
+# Only base R is required here; no extra CRAN/Bioc pkgs for merging
+
+# ── 1. helper: load & prepare one file ─────────────────────────────────────
+load_cxcl_file <- function(path, dataset_tag) {
+  df <- read.csv(path, check.names = FALSE)
+  
+  # Set gene names as rownames and drop the first column
+  rownames(df) <- df[[1]]
+  df <- df[ , -1 ]
+  
+  # Make sample IDs unique by appending dataset tag
+  colnames(df) <- paste(colnames(df), dataset_tag, sep = "_")
+  
+  # Detect whether values are already log-scaled
+  # Microarray RMA: typical range 2–16   RNA-seq raw TPM: 0–50,000
+  if ( max(df, na.rm = TRUE) > 50 ) {
+    message(dataset_tag, ": looks like raw TPM — applying log2(TPM + 1)")
+    df <- log2(df + 1)
+  } else {
+    message(dataset_tag, ": looks already log-scaled — leaving as is")
+  }
+  as.matrix(df)
+}
+
+# ── 2. load the three datasets ─────────────────────────────────────────────
+expr_75214 <- load_cxcl_file("GSE75214_cxcl.csv",  "GSE75214")
+expr_36807 <- load_cxcl_file("GSE36807_cxcl.csv",  "GSE36807")
+expr_235236<- load_cxcl_file("GSE235236_RNAseq_CXCL_Only.csv", "GSE235236")
+
+# ── 3. keep only genes present in *all* three datasets (intersection) ─────
+common_genes <- Reduce(intersect,
+                       list(rownames(expr_75214),
+                            rownames(expr_36807),
+                            rownames(expr_235236)))
+
+expr_75214 <- expr_75214[common_genes, ]
+expr_36807 <- expr_36807[common_genes, ]
+expr_235236<- expr_235236[common_genes, ]
+
+# Step 1: Clean column names for each matrix
+colnames(expr_75214) <- sub("_.*", "", colnames(expr_75214))
+colnames(expr_36807) <- sub("_.*", "", colnames(expr_36807))
+colnames(expr_235236) <- sub("_.*", "", colnames(expr_235236))
+
+# Step 2: Combine all expression data
+expr_all <- cbind(expr_75214, expr_36807, expr_235236)
+
+# ── 5. quick sanity check ─────────────────────────────────────────────────
+cat("Merged matrix dimensions:\n")
+print(dim(expr_all))   # rows = genes, cols = samples
+cat("Example genes:\n")
+print(head(rownames(expr_all)))
+
+# Now expr_all is ready for limma/linear-model effect-size analysis
+
+
+```
+```{r}
+library(GEOquery)
+library(tidyverse)
+
+# ── robust metadata loader ────────────────────────────────────────────────
+get_metadata <- function(geo_id) {
+  message("📥  Fetching: ", geo_id)
+
+  # 1) try fast matrix; 2) fallback SOFT; 3) FTP download
+  geo <- suppressWarnings(tryCatch(getGEO(geo_id, GSEMatrix = TRUE), error = function(e) NULL))
+  if (is.null(geo)) geo <- suppressWarnings(tryCatch(getGEO(geo_id, GSEMatrix = FALSE), error = function(e) NULL))
+  if (is.null(geo)) {
+    ftp <- sprintf("https://ftp.ncbi.nlm.nih.gov/geo/series/%snnn/%s/matrix/%s_series_matrix.txt.gz",
+                   substr(geo_id, 1, nchar(geo_id) - 3), geo_id, geo_id)
+    tmp <- tempfile(fileext = ".gz")
+    try(download.file(ftp, tmp, quiet = TRUE), silent = TRUE)
+    if (file.exists(tmp) && file.info(tmp)$size > 0) geo <- getGEO(filename = tmp)
+  }
+  if (is.null(geo)) stop("Failed to fetch ", geo_id)
+
+  pdata <- if (inherits(geo, "GSE")) pData(geo) else pData(geo[[1]])
+
+  # grab a text field for pattern search
+  txt <- if ("title" %in% colnames(pdata)) pdata$title else
+         apply(pdata[, grep("^characteristics", colnames(pdata)), drop = FALSE], 1, paste, collapse = " ; ")
+
+  # regex dictionaries
+  uc_pat <- "(?i)(uc|ulcerative\\s*colitis)"
+  cd_pat <- "(?i)(cd|crohn['’s]?|crohns)"
+  hc_pat <- "(?i)(healthy|control|normal|non[-_ ]?ibd|ctrl|hc)"
+
+  # Activity pattern: inactive/remission = Inactive, else Active
+  activity <- case_when(
+    str_detect(txt, regex("inactive|remission", ignore_case = TRUE)) ~ "Inactive",
+    TRUE ~ "Active"
+  )
+
+  # ✅ final tibble returned
+  tibble(
+    Sample = rownames(pdata),
+    Title  = as.character(txt),
+    GEO    = geo_id,
+    Group  = case_when(
+      str_detect(txt, regex(uc_pat, ignore_case = TRUE)) ~ "UC",
+      str_detect(txt, regex(cd_pat, ignore_case = TRUE)) ~ "CD",
+      str_detect(txt, regex(hc_pat, ignore_case = TRUE)) ~ "Healthy"
+    ),
+    Activity = activity
+  )
+}
+
+# ── get metadata for all three series ─────────────────────────────────────
+meta_all <- bind_rows(
+  get_metadata("GSE75214"),
+  get_metadata("GSE36807"),
+  get_metadata("GSE235236")
+) %>%
+  mutate(Sample = sub("_.*", "", Sample)) %>%
+  distinct(Sample, .keep_all = TRUE)
+
+# Display summary
+print(table(meta_all$Group))
+print(table(meta_all$Activity, useNA = "always"))
+head(meta_all)
+
+
+```
+
+```{r}
+
+############################################################################
+##  Effect-size calculation with limma
+############################################################################
+library(limma)
+
+## -- 1. align metadata to expression columns ------------------------------
+meta_all <- meta_all[match(colnames(expr_all), meta_all$Sample), ]
+stopifnot(all(colnames(expr_all) == meta_all$Sample))  # safety check
+
+## -- 2. set factor levels: Healthy = reference ----------------------------
+meta_all$Group <- factor(meta_all$Group,
+                         levels = c("Healthy", "CD", "UC"))
+
+##-----Deleting Inactive Sample-----------
+
+## -- 3. design matrix -----------------------------------------------------
+design <- if ("Dataset" %in% names(meta_all)) {
+  model.matrix(~ Group + Dataset, data = meta_all)
+} else {
+  model.matrix(~ Group, data = meta_all)
+}
+
+## -- 4. fit linear model --------------------------------------------------
+fit <- lmFit(expr_all, design)
+fit <- eBayes(fit)
+
+## -- 5. extract logFC, SE, and p-values directly from fit -----------------
+effect_tbl <- data.frame(
+  Gene    = rownames(expr_all),
+  beta_CD = fit$coefficients[, "GroupCD"],
+  se_CD   = sqrt(fit$s2.post) * fit$stdev.unscaled[, "GroupCD"],
+  p_CD    = fit$p.value[, "GroupCD"],
+  beta_UC = fit$coefficients[, "GroupUC"],
+  se_UC   = sqrt(fit$s2.post) * fit$stdev.unscaled[, "GroupUC"],
+  p_UC    = fit$p.value[, "GroupUC"],
+  row.names = NULL
+)
+
+## -- 6. export table ------------------------------------------------------
+write.csv(effect_tbl, "CXCL_effect_sizes.csv", row.names = FALSE)
+head(effect_tbl)
+
+```
+

@@ -1,0 +1,269 @@
+```{r}
+
+# ====== 1. Load Required Packages ======
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+#BiocManager::install("biomaRt", ask = FALSE)
+if (!requireNamespace("R.utils", quietly = TRUE)) install.packages("R.utils")
+
+library(dplyr)
+library(biomaRt)
+library(R.utils)
+
+# ====== 2. Set Working Directory ======
+setwd("C:/Users/lenov/Downloads/GSEDATASETS")
+
+# ====== 3. Extract and Preprocess RSEM Files ======
+untar("GSE235236_RAW.tar", exdir = "GSE235236_RAW")
+
+gz_files <- list.files("GSE235236_RAW", pattern = "\\.genes\\.results\\.gz$", full.names = TRUE, recursive = TRUE)
+if (length(gz_files) > 0) sapply(gz_files, gunzip, overwrite = TRUE)
+
+rsem_files <- list.files("GSE235236_RAW", pattern = "\\.genes\\.results$", full.names = TRUE, recursive = TRUE)
+if (length(rsem_files) == 0) stop("❌ No .genes.results files found.")
+
+# ====== 4. Define Chemokine Gene List ======
+chemokine_genes <- unique(c(
+  "CXCL1", "CXCL2", "CXCL3", "CXCL4", "CXCL5", "CXCL6", "CXCL7", "CXCL8",
+  "CXCL9", "CXCL10", "CXCL11", "CXCL12", "CXCL13", "CXCL14", "CXCL16", "CXCL17", "PPBP",
+  "CCL1", "CCL2", "CCL3", "CCL3L1", "CCL4", "CCL4L2", "CCL5", "CCL7", "CCL8", "CCL11", "CCL13", "CCL14",
+  "CCL15", "CCL16", "CCL17", "CCL18", "CCL19", "CCL20", "CCL21", "CCL22", "CCL23", "CCL24", "CCL25", 
+  "CCL26", "CCL27", "CCL28", "XCL1", "XCL2", "CX3CL1"
+))
+cxcl_genes <- grep("^CXCL", chemokine_genes, value = TRUE)
+
+# ====== 5. Get Ensembl → HGNC Mapping ======
+# Extract all unique Ensembl IDs from the first file
+df0 <- read.delim(rsem_files[1], stringsAsFactors = FALSE)
+gene_ids_full <- sub("\\..*", "", df0$gene_id)
+
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+mapping <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"),
+                 filters = "ensembl_gene_id",
+                 values = gene_ids_full,
+                 mart = ensembl)
+
+chemokine_ensembl_ids <- mapping %>%
+  filter(hgnc_symbol %in% chemokine_genes) %>%
+  pull(ensembl_gene_id)
+
+# ====== 6. Function to Extract Chemokines Only ======
+read_chemokines <- function(file, gene_ids) {
+  df <- read.delim(file, stringsAsFactors = FALSE)
+  df$ensembl_gene_id <- sub("\\..*", "", df$gene_id)
+  df <- df[df$ensembl_gene_id %in% gene_ids, c("ensembl_gene_id", "TPM")]
+  sample <- gsub("\\.genes\\.results$", "", basename(file))
+  colnames(df)[2] <- sample
+  return(df)
+}
+
+# ====== 7. Read Chemokines Only from All Files ======
+rsem_chemokines <- lapply(rsem_files, read_chemokines, gene_ids = chemokine_ensembl_ids)
+expr_chemokines <- Reduce(function(x, y) full_join(x, y, by = "ensembl_gene_id"), rsem_chemokines)
+expr_chemokines[is.na(expr_chemokines)] <- 0
+
+# ====== 8. Merge Symbols and Filter CXCLs ======
+expr_final <- left_join(mapping, expr_chemokines, by = "ensembl_gene_id") %>%
+  filter(hgnc_symbol %in% chemokine_genes) %>%
+  relocate(hgnc_symbol) %>%
+  dplyr::select(-ensembl_gene_id)
+
+cxcl_only <- expr_final %>% filter(hgnc_symbol %in% cxcl_genes)
+
+# ====== 9. Save Outputs ======
+write.csv(expr_final, "GSE235236_RNAseq_Chemokines_Only.csv", row.names = FALSE)
+write.csv(cxcl_only, "GSE235236_RNAseq_CXCL_Only.csv", row.names = FALSE)
+write.csv(mapping, "GSE235236_GeneID_to_HGNC.csv", row.names = FALSE)
+
+
+```
+
+```{r}
+
+# ===== 1. Libraries =====
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+if (!requireNamespace("GEOquery", quietly = TRUE))  BiocManager::install("GEOquery", ask = FALSE)
+if (!requireNamespace("pheatmap", quietly = TRUE)) install.packages("pheatmap")
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2")
+
+library(GEOquery)
+library(pheatmap)
+library(ggplot2)
+library(dplyr)
+
+# ===== 2. Load CXCL TPM Matrix =====
+expr_df <- read.csv("GSE235236_RNAseq_CXCL_Only.csv", check.names = FALSE)
+rownames(expr_df) <- expr_df$hgnc_symbol
+expr_df <- expr_df[, -1]
+
+# Fix colnames to keep only GSM IDs (e.g., GSM7497463)
+colnames(expr_df) <- gsub("_.*", "", colnames(expr_df))
+
+# Log2-transform TPM matrix
+expr_log <- log2(expr_df + 1)
+
+# ===== 3. Download & Parse Sample Metadata =====
+gse <- getGEO("GSE235236", GSEMatrix = TRUE)
+meta <- pData(gse[[1]])
+meta$geo_accession <- toupper(meta$geo_accession)
+meta$group_text <- tolower(meta$title)
+
+# Group assignment based on title
+meta$Group <- case_when(
+  grepl("\\buc\\b", meta$group_text) ~ "UC",
+  grepl("\\bcd\\b|crohn", meta$group_text) ~ "CD",
+  grepl("healthy|normal|control|hc", meta$group_text) ~ "Healthy",
+  TRUE ~ NA_character_
+)
+
+cat("✅ Group counts:\n"); print(table(meta$Group))
+
+# ===== 4. Clustering Function (No Variance Filter) =====
+cluster_cxcl_genes <- function(group_label, expr_mat, meta_tbl) {
+  samples <- meta_tbl %>% filter(Group == group_label) %>% pull(geo_accession)
+  samples <- intersect(samples, colnames(expr_mat))
+  
+  if (length(samples) < 3) {
+    cat("⚠ Not enough samples for", group_label, "\n")
+    return()
+  }
+  
+  gene_expr <- expr_mat[, samples, drop = FALSE]
+  
+  # DEBUG print
+  cat("▶", group_label, ": using", length(samples), "samples and", nrow(gene_expr), "genes\n")
+  
+  # --- Heatmap: gene × gene correlation ---
+  heatmap_file <- paste0("GSE235236_heatmap_CXCL_", group_label, ".png")
+  png(heatmap_file, 1000, 900)
+  pheatmap(cor(gene_expr, method = "pearson", use = "pairwise.complete.obs"),
+           main = paste("CXCL Gene Correlation –", group_label),
+           fontsize = 10,
+           clustering_distance_rows = "correlation",
+           clustering_distance_cols = "correlation",
+           color = colorRampPalette(c("blue", "white", "red"))(100))
+  dev.off()
+  cat("✅ Heatmap saved for", group_label, "\n")
+  
+  # --- PCA: gene expression matrix ---
+  pca <- prcomp(t(gene_expr), scale. = TRUE)
+  pca_df <- as.data.frame(pca$x[, 1:2])
+  pca_df$Sample <- rownames(pca_df)
+  
+  p <- ggplot(pca_df, aes(PC1, PC2, label = Sample)) +
+    geom_point(color = "#0072B2", size = 3) +
+    geom_text(vjust = 1.2, size = 3) +
+    labs(title = paste("PCA of CXCL Gene Expression –", group_label),
+         x = paste0("PC1 (", round(summary(pca)$importance[2, 1] * 100, 1), "%)"),
+         y = paste0("PC2 (", round(summary(pca)$importance[2, 2] * 100, 1), "%)")) +
+    theme_minimal(base_size = 14)
+  
+  ggsave(paste0("GSE235236_PCA_CXCL_", group_label, ".png"), p, width = 8, height = 6)
+  cat("✅ PCA saved for", group_label, "\n")
+}
+
+# ===== 5. Run for UC, CD, Healthy =====
+for (grp in c("UC", "CD", "Healthy")) {
+  cat("▶ Clustering CXCL genes for:", grp, "\n")
+  cluster_cxcl_genes(grp, expr_log, meta)
+}
+
+
+```
+```{r}
+
+# Load required libraries
+library(tidyverse)
+library(pheatmap)
+library(RColorBrewer)
+library(GEOquery)
+library(FactoMineR)
+library(factoextra)
+setwd("C:/Users/lenov/Downloads/GSEDATASETS")
+# Step 1: Load expression data and log2-transform
+data <- read.csv("GSE235236_RNAseq_CXCL_Only.csv", row.names = 1)
+data_log2 <- log2(data + 1)
+
+# Step 2: Download metadata
+gse <- getGEO("GSE235236", GSEMatrix = TRUE)[[1]]
+meta <- pData(gse)
+
+# Step 3: Extract disease status from the correct column
+# Make sure this is the correct column - adjust if needed (e.g.,characteristics_ch1.2)
+meta <- meta %>%
+  mutate(Sample = geo_accession) %>%
+  mutate(disease_status = case_when(
+    grepl("disease: CD", characteristics_ch1.2, ignore.case = TRUE) ~ "CD",
+    grepl("disease: UC", characteristics_ch1.2, ignore.case = TRUE) ~ "UC",
+    grepl("disease: HC", characteristics_ch1.2, ignore.case = TRUE) ~ "Healthy",
+    TRUE ~ "Unknown"
+  ))
+
+# Step 4: Match metadata Sample IDs with expression column names
+expr_gsm_ids <- sub("_.*", "", colnames(data_log2))  # Strip suffix
+col_mapping <- data.frame(
+  gsm_id = expr_gsm_ids,
+  full_colname = colnames(data_log2),
+  stringsAsFactors = FALSE
+)
+
+# Filter and align metadata
+meta <- meta %>% filter(Sample %in% col_mapping$gsm_id)
+matched_cols <- col_mapping %>% filter(gsm_id %in% meta$Sample)
+expr <- data_log2[, matched_cols$full_colname]
+meta <- meta[match(matched_cols$gsm_id, meta$Sample), ]
+
+# Step 5: PCA for all samples
+group_labels <- factor(meta$disease_status)
+pca_all <- PCA(t(expr), graph = FALSE)
+fviz_pca_ind(pca_all,
+             title = "PCA - All Samples",
+             col.ind = group_labels,
+             palette = c("CD" = "#2E86C1", "UC" = "#E74C3C", "Healthy"
+= "#27AE60"),
+             repel = TRUE)
+
+# Step 6: Subset data by group
+expr_UC <- expr[, meta$disease_status == "UC"]
+expr_CD <- expr[, meta$disease_status == "CD"]
+expr_HC <- expr[, meta$disease_status == "Healthy"]
+
+# Step 7: Correlation heatmap function
+generate_heatmap <- function(expr_subset, disease_group, dataset_id) {
+  if (ncol(expr_subset) < 2) return(message("🚫 Skipping ", disease_group, ": not enough samples"))
+
+  expr_subset <- expr_subset[apply(expr_subset, 1, sd, na.rm = TRUE) > 0, ]
+  if (nrow(expr_subset) < 2) return(message("🚫 Skipping ", disease_group, ": not enough variable genes"))
+
+  cor_matrix <- cor(t(expr_subset), method = "pearson", use = "pairwise.complete.obs")
+  cor_matrix[is.na(cor_matrix)] <- 0
+  cor_matrix[is.infinite(cor_matrix)] <- 0
+
+  heat_colors <- colorRampPalette(rev(brewer.pal(11, "RdYlBu")))(100)
+  output_file <- paste0(dataset_id, "_", disease_group, "_CXCL_heatmap.png")
+
+  pheatmap::pheatmap(cor_matrix,
+    cluster_rows = TRUE,
+    cluster_cols = TRUE,
+    color = heat_colors,
+    border_color = "white",
+    main = paste0(dataset_id, " – ", disease_group, " – CXCL Correlation Heatmap"),
+    fontsize = 10,
+    fontsize_row = 9,
+    fontsize_col = 9,
+    legend_breaks = c(-1, -0.5, 0, 0.5, 1),
+    display_numbers = FALSE,
+    filename = output_file,
+    width = 8,
+    height = 8
+  )
+
+  message("✅ Saved PNG heatmap to: ", output_file)
+}
+generate_heatmap(expr_UC, "UC", "GSE235236")
+generate_heatmap(expr_CD, "CD", "GSE235236")
+generate_heatmap(expr_HC, "Healthy", "GSE235236")
+
+
+```
+
+

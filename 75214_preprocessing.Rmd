@@ -1,0 +1,126 @@
+```{r}
+# ====== Install and Load Packages ======
+# BiocManager::install(c("oligo", "biomaRt", "GEOquery", "pd.hugene.1.0.st.v1", "hugene10sttranscriptcluster.db"))
+# install.packages(c("R.utils", "pheatmap", "ggplot2"))
+
+library(R.utils)
+library(oligo)
+library(biomaRt)
+library(GEOquery)
+library(hugene10sttranscriptcluster.db)
+library(AnnotationDbi)
+library(pheatmap)
+library(dplyr)
+library(ggplot2)
+
+# ====== Setup ======
+setwd("C:/Users/lenov/Downloads/GSEDATASETS")
+untar("GSE75214_RAW.tar", exdir = "GSE75214/raw")
+setwd("GSE75214/raw")
+# 1. Clean up leftover .tmp files from previous runs
+file.remove(list.files(pattern = "\\.CEL\\.tmp$", full.names = TRUE))
+sapply(list.files(pattern = "\\.gz$", full.names = TRUE), gunzip, overwrite = TRUE, remove = TRUE)
+
+
+# ====== Expression Processing ======
+cel_files <- list.files(pattern = "CEL$", full.names = TRUE)
+raw_data <- read.celfiles(cel_files)
+eset <- rma(raw_data)
+expr <- exprs(eset) 
+
+# ====== Annotation ======
+probe_ids <- rownames(expr)
+map <- AnnotationDbi::select(hugene10sttranscriptcluster.db,
+                             keys = probe_ids,
+                             columns = c("SYMBOL"),
+                             keytype = "PROBEID")
+map <- map[!is.na(map$SYMBOL), ]
+colnames(map) <- c("ProbeID", "hgnc_symbol")
+
+expr_df <- as.data.frame(expr)
+expr_df$ProbeID <- rownames(expr_df)
+merged <- merge(expr_df, map, by = "ProbeID")
+
+# ====== Chemokine Genes ======
+chemokine_genes <- c("CXCL1", "CXCL2", "CXCL3", "CXCL4", "CXCL5", "CXCL6", "CXCL7",
+                     "CXCL8", "CXCL9", "CXCL10", "CXCL11", "CXCL12", "CXCL13", "CXCL14",
+                     "CXCL16", "CXCL17")
+cxcl_data <- merged[merged$hgnc_symbol %in% chemokine_genes, ]
+
+# ====== Collapse multiple probes to gene-level average ======
+cxcl_data_collapsed <- cxcl_data %>%
+  dplyr::select(-ProbeID) %>%
+  group_by(hgnc_symbol) %>%
+  summarise(across(everything(), mean), .groups = "drop")
+
+# Save to CSV
+write.csv(cxcl_data_collapsed, "C:/Users/lenov/Downloads/GSEDATASETS/GSE75214_cxcl.csv", row.names = FALSE)
+
+
+# ====== Reload Collapsed CXCL Data ======
+setwd("C:/Users/lenov/Downloads/GSEDATASETS")
+expr_df <- read.csv("GSE75214_cxcl.csv", check.names = FALSE)
+rownames(expr_df) <- expr_df$hgnc_symbol
+expr_df$hgnc_symbol <- NULL
+colnames(expr_df) <- gsub("(_.*|\\.CEL.*|\\.gz)$", "", colnames(expr_df), ignore.case = TRUE)
+
+# ====== Load Metadata and Assign Groups ======
+gse <- getGEO("GSE75214", GSEMatrix = TRUE)
+meta <- pData(gse[[1]])
+meta$geo_accession <- toupper(meta$geo_accession)
+meta$group_text <- tolower(apply(meta, 1, paste, collapse = " "))
+meta$Group <- ifelse(grepl("ulcerative colitis|\\buc\\b", meta$group_text), "UC",
+                     ifelse(grepl("crohn", meta$group_text), "CD",
+                            ifelse(grepl("healthy|control|normal", meta$group_text), "Healthy", "Other")))
+
+# ====== Function: CXCL Correlation + PCA per Group ======
+cluster_cxcl_genes <- function(group_label, expr_df, meta) {
+  samples <- meta[meta$Group == group_label, "geo_accession"]
+  samples <- intersect(samples, colnames(expr_df))
+  
+  if (length(samples) < 3) {
+    cat("⚠ Not enough samples for", group_label, "\n")
+    return()
+  }
+  
+  gene_expr <- expr_df[, samples, drop = FALSE]
+  gene_expr <- gene_expr[apply(gene_expr, 1, var) > 0, , drop = FALSE]
+  
+  # Heatmap
+  heatmap_file <- paste0("heatmap_CXCL_genes_75214_", group_label, ".png")
+  png(heatmap_file, width = 1000, height = 900)
+  pheatmap(cor(t(gene_expr), method = "pearson"),
+           main = paste("CXCL Gene Correlation Heatmap –", group_label),
+           fontsize_row = 10,
+           fontsize_col = 10,
+           clustering_distance_rows = "correlation",
+           clustering_distance_cols = "correlation",
+           color = colorRampPalette(c("blue", "white", "red"))(100))
+  dev.off()
+  cat("✅ Heatmap saved for", group_label, "\n")
+  
+  # PCA
+  pca <- prcomp(gene_expr, scale. = TRUE)
+  pca_df <- as.data.frame(pca$x)
+  pca_df$Gene <- rownames(pca_df)
+  
+  p <- ggplot(pca_df, aes(x = PC1, y = PC2, label = Gene)) +
+    geom_point(color = "#D55E00", size = 3) +
+    geom_text(size = 3.2, vjust = 1.2) +
+    labs(title = paste("PCA of CXCL Genes – 75214", group_label),
+         x = paste0("PC1 (", round(summary(pca)$importance[2,1]*100, 1), "%)"),
+         y = paste0("PC2 (", round(summary(pca)$importance[2,2]*100, 1), "%)")) +
+    theme_minimal(base_size = 14)
+  
+  ggsave(paste0("PCA_CXCL_genes_", group_label, ".png"), plot = p, width = 8, height = 6)
+  cat("✅ PCA saved for", group_label, "\n")
+}
+
+# ====== Run for Each Group ======
+for (grp in c("UC", "CD", "Healthy")) {
+  cat("▶ Clustering CXCL genes for:", grp, "\n")
+  cluster_cxcl_genes(grp, expr_df, meta)
+}
+```
+
+

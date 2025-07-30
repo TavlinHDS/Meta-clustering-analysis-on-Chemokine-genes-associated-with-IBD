@@ -1,0 +1,108 @@
+```{r}
+# === Load Required Libraries ===
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(RColorBrewer)
+library(scales)
+
+# === Set Paths ===
+base_dir  <-"C:/Users/lenov/Downloads/GSEDATASETS"
+file_path <- file.path(base_dir, "Forest_Plot.xlsx")
+setwd(base_dir)
+
+# === Parse CI Column into Numeric Bounds ===
+parse_ci <- function(df) {
+  colnames(df) <- c("Gene", "Study", "OR", "CI", "Inference")
+  df %>%
+    mutate(
+      OR = as.numeric(gsub(",", ".", OR)),
+      CI = gsub("[\\(\\)\\[\\]]", "", CI),
+      CI = gsub("[–−—]", "-", CI),
+      CI = gsub(",", ".", CI),
+      CI = trimws(CI),
+      Lower = as.numeric(sub("^(\\d+(\\.\\d+)?)\\s*-.*$", "\\1", CI)),
+      Upper = as.numeric(sub("^.*-(\\s*\\d+(\\.\\d+)?)$", "\\1", CI)),
+      Shape = ifelse(Inference == "Pooled estimate", "Diamond", "Point")
+    ) %>%
+    filter(!is.na(OR) & !is.na(Lower) & !is.na(Upper))
+}
+
+# === Add pooled row for genes with >1 study ===
+add_pooled <- function(df) {
+  pooled <- df %>%
+    group_by(Gene) %>%
+    filter(n() > 1) %>%
+    summarise(
+      Study     = paste0("Pooled (", Gene[1], ")"),
+      Gene      = Gene[1],
+      OR        = round(mean(OR, na.rm = TRUE), 2),
+      Lower     = round(mean(Lower, na.rm = TRUE), 2),
+      Upper     = round(mean(Upper, na.rm = TRUE), 2),
+      Inference = "Pooled estimate",
+      Shape     = "Diamond",
+      .groups   = "drop"
+    )
+  bind_rows(df, pooled)
+}
+
+# === Forest Plot Function with Correct Shape/Fills/Legend ===
+setwd("C:/Users/lenov/Downloads/GSEDATASETS")
+plot_forest_thesis <- function(df, group_label, outfile) {
+  df <- df %>%
+    mutate(
+      Study_f = factor(Study, levels = rev(unique(Study))),
+      Shape = factor(Shape, levels = c("Point", "Diamond"))
+    )
+ 
+  gene_colors <- setNames(
+    c("#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9"),
+    sort(unique(df$Gene))
+  )
+ 
+  p <- ggplot(df, aes(x = OR, y = Study_f, shape = Shape, fill = Gene)) +
+    geom_errorbarh(aes(xmin = Lower, xmax = Upper), height = 0.20, color = "black", size = 0.5) +
+    geom_point(size = 4, color = "black") +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "black", size = 0.5) +
+    # Shape: 21 = circle, 23 = diamond (Correct mapping!)
+    scale_shape_manual(
+      name = "Estimate Type",
+      values = c("Point" = 21, "Diamond" = 23),
+      labels = c("Individual study", "Pooled estimate")
+    ) +
+    scale_fill_manual(
+      name = "Gene",
+      values = gene_colors
+    ) +
+    guides(
+      # This is key: use correct shape for override in legend
+      shape = guide_legend(order = 1,
+                           override.aes = list(
+                             fill = c("#CCCCCC", "#CCCCCC"),
+                             shape = c(21, 23),
+                             color = "black")),
+      fill = guide_legend(order = 2, override.aes = list(shape = 21, size = 5, color = "black"))
+    ) +
+    scale_x_log10(labels = label_number(accuracy = 0.1)) +
+    labs(
+      title = paste0("Forest Plot: CXCL Genes in ", group_label),
+      x = "Odds Ratio (log scale)",
+      y = "Study"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      axis.text.y     = element_text(size = 10),
+      axis.text.x     = element_text(size = 11),
+      axis.title.x    = element_text(size = 12, margin = margin(t = 8)),
+      axis.title.y    = element_text(size = 12, margin = margin(r = 10)),
+      plot.title      = element_text(face = "bold", size = 14, hjust = 0.5, margin = margin(b = 8)),
+      legend.title    = element_text(size = 11),
+      legend.text     = element_text(size = 11),
+      legend.position = "right"
+    )
+
+  ggsave(outfile, plot = p, width = 10, height = max(6, nrow(df) * 0.4), dpi = 300, bg = "white")
+  message("✅ Plot saved with correct legend and shapes: ", outfile)
+}
+```
+
